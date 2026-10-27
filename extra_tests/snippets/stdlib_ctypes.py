@@ -355,6 +355,7 @@ else:
     import ctypes
     import os
     from ctypes import wintypes
+    from typing import NamedTuple
 
     libc = cdll.msvcrt
     libc.rand()
@@ -367,6 +368,50 @@ else:
     # libc.printf(test_byte_array)
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class ConsoleCoord(ctypes.Structure):
+        _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
+
+    class WindowsCoordinates(NamedTuple):
+        row: int
+        col: int
+
+        @classmethod
+        def from_param(cls, value):
+            return ConsoleCoord(value.col, value.row)
+
+    class TypeCodeCollision:
+        # An unrelated `_type_` must not turn a custom adapter into a scalar.
+        _type_ = "z"
+
+        @classmethod
+        def from_param(cls, value):
+            return ConsoleCoord(value.col, value.row)
+
+    def check_custom_from_param(adapter):
+        fill = kernel32.FillConsoleOutputCharacterW
+        fill.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_wchar,
+            wintypes.DWORD,
+            adapter,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        fill.restype = wintypes.BOOL
+        written = wintypes.DWORD(0)
+        # The invalid handle and zero length prevent console mutation. The
+        # call still converts the custom adapter's COORD by-value argument.
+        fill(
+            wintypes.HANDLE(-1),
+            ctypes.c_wchar(" "),
+            wintypes.DWORD(0),
+            WindowsCoordinates(row=4, col=2),
+            ctypes.byref(written),
+        )
+
+    check_custom_from_param(WindowsCoordinates)
+    check_custom_from_param(TypeCodeCollision)
+
     get_current_process = kernel32.GetCurrentProcess
     get_current_process.argtypes = ()
     get_current_process.restype = ctypes.c_void_p

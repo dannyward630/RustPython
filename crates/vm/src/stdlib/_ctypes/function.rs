@@ -250,33 +250,34 @@ impl ArgumentType for PyTypeRef {
         value: PyObjectRef,
         vm: &VirtualMachine,
     ) -> PyResult<(CArgValue, Option<PyObjectRef>)> {
-        // Validate the argument type up front (mirrors the pre-conversion
-        // check): pointer-like ctypes types are always acceptable; a simple
-        // type must carry a known _type_ code; anything else is unsupported.
-        let type_code = if self.fast_issubclass(CArgObject::static_type())
-            || self.fast_issubclass(PyCPointer::static_type())
-            || self.fast_issubclass(PyCFuncPtr::static_type())
-            || self.fast_issubclass(PyCStructure::static_type())
-            || self.fast_issubclass(PyCUnion::static_type())
+        // Only initialized ctypes storage defines a scalar type code. A
+        // custom from_param adapter may have an unrelated `_type_` attribute.
+        let type_code = self
+            .stg_info_opt()
+            .and_then(|info| info.scalar_code)
+            .map(|code| code.to_string());
+        if let Some(typ) = type_code.as_deref()
+            && ffi_type_from_code(typ).is_none()
         {
-            None
-        } else {
-            // Converters belong to initialized storage, not mutable _type_.
-            let typ = self
-                .type_code(vm)
-                .ok_or_else(|| vm.new_type_error("Unsupported argument type"))?;
-            if ffi_type_from_code(&typ).is_none() {
-                return Err(vm.new_type_error(format!("Unsupported argument type: {typ}")));
-            }
-            Some(typ)
-        };
+            return Err(vm.new_type_error(format!("Unsupported argument type: {typ}")));
+        }
 
         // Call from_param first to convert the value
         // converter = PyTuple_GET_ITEM(argtypes, i);
         // v = PyObject_CallOneArg(converter, arg);
-        let from_param = self
+        let from_param = match self
             .as_object()
-            .get_attr(vm.ctx.intern_str("from_param"), vm)?;
+            .get_attr(vm.ctx.intern_str("from_param"), vm)
+        {
+            Ok(from_param) => from_param,
+            Err(error)
+                if type_code.is_none()
+                    && error.fast_isinstance(vm.ctx.exceptions.attribute_error) =>
+            {
+                return Err(vm.new_type_error("Unsupported argument type"));
+            }
+            Err(error) => return Err(error),
+        };
         let converted = from_param.call((value,), vm)?;
 
         // Then pass the converted value to ConvParam logic
@@ -332,12 +333,17 @@ impl ArgumentType for PyTypeRef {
         }
 
         // PyCSimple (already a ctypes instance from from_param)
-        if let Ok(simple) = converted.downcast::<PyCSimple>() {
-            let code = type_code
-                .as_deref()
-                .and_then(|s| s.chars().next())
-                .ok_or_else(|| vm.new_type_error("Unsupported argument type"))?;
-            return Ok((simple.to_carg_value(code), Some(simple.into())));
+        if let Some(simple) = converted.downcast_ref::<PyCSimple>()
+            && let Some(code) = type_code.as_deref().and_then(|s| s.chars().next())
+        {
+            return Ok((simple.to_carg_value(code), Some(converted.clone())));
+        }
+
+        // Custom from_param adapters may return any value accepted by
+        // ConvParam, including a ctypes structure passed by value.
+        if type_code.is_none() {
+            let argument = conv_param(&converted, vm)?;
+            return Ok((argument.value, argument.keep));
         }
 
         Err(vm.new_type_error("Unsupported argument type"))
